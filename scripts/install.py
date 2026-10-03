@@ -4,7 +4,7 @@ r"""install.py — agy-imagegen-skill 安装与环境配置脚本。
 功能：
 1. 检查并安装 Python 依赖（Pillow）
 2. 将 bin/ 加入用户 PATH 环境变量（清理旧失效路径，广播变更）
-3. 将 skills/agy-imagegen 软链或复制至全局 ~/.gemini/config/skills/agy-imagegen
+3. 将仓库根目录（单一事实源）软链或同步至全局 ~/.gemini/config/skills/agy-imagegen
 """
 
 from __future__ import annotations
@@ -26,17 +26,6 @@ if sys.platform == "win32":
 
 SKILL_ROOT = pathlib.Path(__file__).resolve().parent.parent
 BIN_DIR = SKILL_ROOT / "bin"
-SOURCE_SKILL_DIR = SKILL_ROOT / "skills" / "agy-imagegen"
-REFERENCES_DIR = SKILL_ROOT / "references"
-
-
-def sync_skill_assets() -> None:
-    """确保 skills/agy-imagegen 自包含 references。"""
-    target_ref = SOURCE_SKILL_DIR / "references"
-    if REFERENCES_DIR.exists():
-        target_ref.mkdir(parents=True, exist_ok=True)
-        for f in REFERENCES_DIR.glob("*.md"):
-            shutil.copy2(f, target_ref / f.name)
 
 
 def check_and_install_dependencies() -> bool:
@@ -119,8 +108,33 @@ def update_windows_user_path(add_bin: bool = True) -> bool:
         return False
 
 
-def link_global_skill(unlink: bool = False, prefer_symlink: bool = True) -> bool:
-    """软链或复制至 ~/.gemini/config/skills/agy-imagegen。"""
+def copy_skill_bundle(src_root: pathlib.Path, target_dir: pathlib.Path) -> None:
+    """复制纯净技能包至目标目录（排除测试和 VCS 文件）。"""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    # 核心清单文件
+    skill_md = src_root / "SKILL.md"
+    if skill_md.is_file():
+        shutil.copy2(skill_md, target_dir / "SKILL.md")
+
+    # 核心子目录
+    for sub in ("scripts", "references", "resources", "examples"):
+        src_sub = src_root / sub
+        if not src_sub.is_dir():
+            continue
+        dst_sub = target_dir / sub
+        dst_sub.mkdir(parents=True, exist_ok=True)
+        for item in src_sub.iterdir():
+            if item.name.startswith(".") or item.name == "__pycache__":
+                continue
+            dst_item = dst_sub / item.name
+            if item.is_file():
+                shutil.copy2(item, dst_item)
+            elif item.is_dir():
+                shutil.copytree(item, dst_item, dirs_exist_ok=True)
+
+
+def link_global_skill(unlink: bool = False, prefer_symlink: bool = True, force_dev: bool = False) -> bool:
+    """软链或复制本仓库技能至 ~/.gemini/config/skills/agy-imagegen。"""
     home = pathlib.Path.home()
     target_dir = home / ".gemini" / "config" / "skills" / "agy-imagegen"
 
@@ -129,7 +143,6 @@ def link_global_skill(unlink: bool = False, prefer_symlink: bool = True) -> bool
             target_dir.unlink()
             print(f"[+] 已移除软链: {target_dir}")
         elif target_dir.is_dir():
-            # 安全检查：仅当目录内包含本项目标记时才执行删除
             marker = target_dir / "SKILL.md"
             if marker.exists() and "agy-imagegen" in marker.read_text(encoding="utf-8", errors="ignore"):
                 shutil.rmtree(target_dir)
@@ -138,14 +151,13 @@ def link_global_skill(unlink: bool = False, prefer_symlink: bool = True) -> bool
                 print(f"[!] 警告: 目录 {target_dir} 缺少有效标记，跳过删除以防误伤。", file=sys.stderr)
         return True
 
-    sync_skill_assets()
     target_dir.parent.mkdir(parents=True, exist_ok=True)
 
     if target_dir.exists() or target_dir.is_symlink():
         if target_dir.is_symlink():
             try:
-                if target_dir.resolve() == SOURCE_SKILL_DIR.resolve():
-                    print(f"[+] 软链已正确存在: {target_dir} -> {SOURCE_SKILL_DIR}")
+                if target_dir.resolve() == SKILL_ROOT.resolve():
+                    print(f"[+] 软链已正确存在: {target_dir} -> {SKILL_ROOT}")
                     return True
             except Exception:
                 pass
@@ -153,16 +165,19 @@ def link_global_skill(unlink: bool = False, prefer_symlink: bool = True) -> bool
         elif target_dir.is_dir():
             shutil.rmtree(target_dir)
 
-    if prefer_symlink:
+    if prefer_symlink or force_dev:
         try:
-            target_dir.symlink_to(SOURCE_SKILL_DIR, target_is_directory=True)
-            print(f"[+] 成功创建全局技能软链: {target_dir} -> {SOURCE_SKILL_DIR}")
+            target_dir.symlink_to(SKILL_ROOT, target_is_directory=True)
+            print(f"[+] 成功创建全局技能软链: {target_dir} -> {SKILL_ROOT}")
             return True
         except OSError as e:
-            print(f"[!] 创建软链未获权限 ({e})，自动回退为目录拷贝模式...")
+            if force_dev:
+                print(f"[-] 开发者模式要求软链但创建失败: {e}。请开启 Windows 开发者模式或以管理员身份运行。", file=sys.stderr)
+                return False
+            print(f"[!] 创建软链未获权限 ({e})，自动回退为纯净目录拷贝模式...")
 
-    shutil.copytree(SOURCE_SKILL_DIR, target_dir)
-    print(f"[+] 已复制技能文件至: {target_dir}")
+    copy_skill_bundle(SKILL_ROOT, target_dir)
+    print(f"[+] 已复制纯净技能文件至: {target_dir}")
     return True
 
 
@@ -190,8 +205,9 @@ def main() -> int:
     if not update_windows_user_path(add_bin=True):
         print("[-] PATH 配置遇到问题。", file=sys.stderr)
 
-    if not link_global_skill(unlink=False, prefer_symlink=True):
+    if not link_global_skill(unlink=False, prefer_symlink=True, force_dev=args.dev):
         print("[-] 技能配置遇到问题。", file=sys.stderr)
+        return 1
 
     print("\n[+] 全部配置完成！")
     print("    - 命令行已就绪: `agy-img --help` 或 `chromakey --help`")

@@ -1,0 +1,12 @@
+# Git attributes configuration
+* text=auto
+
+# Ensure POSIX shell scripts always use LF line endings
+bin/agy-img text eol=lf
+bin/chromakey text eol=lf
+*.sh text eol=lf
+
+# Windows batch and PowerShell scripts use CRLF
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf

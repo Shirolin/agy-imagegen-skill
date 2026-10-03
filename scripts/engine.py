@@ -2,11 +2,11 @@
 """engine.py — agy-imagegen 统一生图与资产后处理深模块 (Pipeline Engine)。
 
 作为本项目的核心深模块 (Deep Module)，封装：
-1. 单实例并发互斥锁与孤儿锁自动回收 (Cross-platform SingleInstanceLock)
-2. agy 宿主定位与子进程调度，防管道死锁安全通信
+1. 跨平台单实例并发互斥锁 (Cross-platform SingleInstanceLock)
+2. agy 宿主定位与子进程调度，防管道死锁安全异步读取
 3. 路径边界限制与参考图防逃逸验证
-4. 图像魔数快速校验与扩展名自适应适配
-5. 进程内直接衔接向量化色键抠图、去色溢与尺寸规约
+4. 图像魔数快速校验与扩展名自适应校准
+5. 进程内直接衔接向量化色键抠图、去色溢与原图保护 (Keep-Raw)
 """
 
 from __future__ import annotations
@@ -20,8 +20,14 @@ import subprocess
 import sys
 import tempfile
 import time
-import uuid
 from typing import List, Tuple
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # 导入同级 chromakey 模块
 CURRENT_DIR = pathlib.Path(__file__).resolve().parent
@@ -51,50 +57,19 @@ class InvalidArgumentError(EngineError):
 
 
 class SingleInstanceLock:
-    """跨平台单实例互斥锁，支持死进程孤儿锁自动回收。"""
+    """跨平台单实例互斥锁。操作系统保证进程退出时句柄与锁自动释放。"""
 
-    def __init__(self, wait_seconds: int = 60):
+    def __init__(self, wait_seconds: int = 60, lock_path: str | pathlib.Path | None = None):
         self.wait_seconds = wait_seconds
-        self.lock_path = pathlib.Path(tempfile.gettempdir()) / "agy-img.single.lock"
-        self._file = None
-
-    def _is_process_alive(self, pid: int) -> bool:
-        if pid <= 0:
-            return False
-        if sys.platform == "win32":
-            import ctypes
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
-                return True
-            return False
+        if lock_path:
+            self.lock_path = pathlib.Path(lock_path)
         else:
-            try:
-                os.kill(pid, 0)
-                return True
-            except OSError:
-                return False
+            self.lock_path = pathlib.Path(tempfile.gettempdir()) / "agy-img.single.lock"
+        self._file = None
 
     def acquire(self) -> None:
         start_time = time.monotonic()
         while time.monotonic() - start_time < self.wait_seconds:
-            # 探测孤儿锁
-            if self.lock_path.exists():
-                try:
-                    content = self.lock_path.read_text(encoding="utf-8", errors="ignore")
-                    m = re.search(r"pid=(\d+)", content)
-                    if m:
-                        holder_pid = int(m.group(1))
-                        if not self._is_process_alive(holder_pid):
-                            # 持有者已死，清理残留孤儿锁
-                            try:
-                                self.lock_path.unlink(missing_ok=True)
-                            except OSError:
-                                pass
-                except OSError:
-                    pass
-
             try:
                 self._file = open(self.lock_path, "a+b")
                 if sys.platform == "win32":
@@ -105,7 +80,7 @@ class SingleInstanceLock:
                     import fcntl
                     fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-                # 成功加锁，写入当前 PID 与时间戳
+                # 成功获取排他锁
                 self._file.seek(0)
                 self._file.truncate()
                 lock_data = f"pid={os.getpid()} ts={time.time()}\n".encode("utf-8")
@@ -189,8 +164,6 @@ def is_path_inside(target: pathlib.Path, parent: pathlib.Path) -> bool:
 
 def find_image_path(text: str, work_dir: pathlib.Path) -> pathlib.Path | None:
     """从大模型响应中解析产物图片路径，并强校验其必须位于 work_dir 内，严防路径逃逸。"""
-    candidate: pathlib.Path | None = None
-
     if text:
         # 1. 优先匹配 IMAGE_PATH: <path>
         for line in text.splitlines():
@@ -340,10 +313,12 @@ def generate_image_asset(
     canvas: int | None = None,
     name: str | None = None,
     model: str | None = None,
-    timeout: int = 180,
-    lock_wait: int = 60,
+    timeout: int | None = None,
+    lock_wait: int | None = None,
+    keep_raw: bool = True,
+    lock_path: str | pathlib.Path | None = None,
 ) -> pathlib.Path:
-    """单一核心深模块接口 (Deep Interface)：完成生图、防逃逸与向量化后处理规约全流程。"""
+    """单一核心深模块接口 (Deep Interface)：完成生图、防逃逸、原图保护与向量化后处理规约全流程。"""
     # 1. 基础校验
     prompt = prompt.strip()
     if not prompt:
@@ -371,9 +346,27 @@ def generate_image_asset(
                 raise InvalidArgumentError(f"error: --ref file not found: {p}")
             resolved_refs.append(p)
 
-    driver_model = model or os.environ.get("AGY_IMG_MODEL", "gemini-3.8-flash-low")
-    timeout_sec = int(os.environ.get("AGY_IMG_TIMEOUT", timeout))
-    lock_wait_sec = int(os.environ.get("AGY_IMG_LOCK_WAIT", lock_wait))
+    # 优先级规则：显式参数 > 环境变量 > 默认值
+    if model is not None:
+        driver_model = model
+    elif "AGY_IMG_MODEL" in os.environ:
+        driver_model = os.environ["AGY_IMG_MODEL"]
+    else:
+        driver_model = "gemini-3.8-flash-low"
+
+    if timeout is not None:
+        timeout_sec = timeout
+    elif "AGY_IMG_TIMEOUT" in os.environ:
+        timeout_sec = int(os.environ["AGY_IMG_TIMEOUT"])
+    else:
+        timeout_sec = 180
+
+    if lock_wait is not None:
+        lock_wait_sec = lock_wait
+    elif "AGY_IMG_LOCK_WAIT" in os.environ:
+        lock_wait_sec = int(os.environ["AGY_IMG_LOCK_WAIT"])
+    else:
+        lock_wait_sec = 60
 
     agy_exe = resolve_agy_executable()
     check_agy_auth()
@@ -384,7 +377,7 @@ def generate_image_asset(
             extra_dirs.append(r.parent)
 
     # 2. 单实例并发互斥加锁
-    with SingleInstanceLock(wait_seconds=lock_wait_sec):
+    with SingleInstanceLock(wait_seconds=lock_wait_sec, lock_path=lock_path):
         name_clause = f' Save the image with base name "{name}".' if name else ""
 
         ref_block = ""
@@ -403,9 +396,8 @@ def generate_image_asset(
 
         max_attempts = 2
         last_error = ""
-        final_src: pathlib.Path | None = None
-        final_kind: dict | None = None
         last_response = ""
+        final_image: pathlib.Path | None = None
 
         # 3. 调度循环与瞬时容错重试
         for attempt in range(1, max_attempts + 1):
@@ -442,60 +434,55 @@ def generate_image_asset(
 
                 last_response = response_txt
                 if ok and src_path and kind:
-                    # 成功获取合法图片，将图片安全移出工作区
-                    safe_temp = pathlib.Path(tempfile.gettempdir()) / f"agy-safe-{uuid.uuid4().hex}{kind['ext']}"
-                    shutil.copy2(src_path, safe_temp)
-                    final_src = safe_temp
-                    final_kind = kind
+                    # 4. 成功获取图片，直接拷贝至目标路径并处理原图保护
+                    if chromakey:
+                        # 开启色键时：原图保存为 *_raw.<ext>，保证素材不被覆盖丢失
+                        raw_stem = f"{out_path.stem}_raw" if keep_raw else f"{out_path.stem}_chroma_tmp"
+                        raw_output = out_dir / f"{raw_stem}{kind['ext']}"
+                        shutil.copy2(src_path, raw_output)
+
+                        target_png = out_path.with_suffix(".png")
+                        success = process_image(
+                            src_path=raw_output,
+                            dst_path=target_png,
+                            bg_color=chromakey.lower(),
+                            canvas_size=canvas,
+                            padding_ratio=0.04,
+                        )
+                        if not success or not target_png.is_file():
+                            raise EngineError(
+                                f"error: chromakey post-processing failed for {raw_output.name}",
+                                exit_code=1,
+                            )
+                        if not keep_raw and raw_output.is_file():
+                            raw_output.unlink(missing_ok=True)
+                        final_image = target_png
+                    else:
+                        # 全幅图像模式：根据真实魔数校准扩展名后直接落地
+                        raw_output = resolve_output_path(out_path, kind["ext"])
+                        shutil.copy2(src_path, raw_output)
+                        final_image = raw_output
                     break
 
                 last_error = err_msg
                 if not recoverable or attempt >= max_attempts:
                     raise EngineError(f"error: {err_msg}", exit_code=code)
             finally:
-                # 清理临时工作目录
                 shutil.rmtree(work_dir, ignore_errors=True)
 
-        if not final_src or not final_kind:
+        if not final_image or not final_image.is_file():
             raise EngineError(f"error: {last_error}", exit_code=1)
 
-        try:
-            # 4. 解决输出路径校准
-            raw_output = resolve_output_path(out_path, final_kind["ext"])
-            shutil.copy2(final_src, raw_output)
-
-            final_image = raw_output
-
-            # 5. 进程内直接衔接色键处理（免子进程跨语言调度）
-            if chromakey:
-                target_png = raw_output.with_suffix(".png")
-                success = process_image(
-                    src_path=raw_output,
-                    dst_path=target_png,
-                    bg_color=chromakey.lower(),
-                    canvas_size=canvas,
-                    padding_ratio=0.04,
-                )
-                if not success or not target_png.is_file():
-                    raise EngineError(
-                        f"error: chromakey post-processing failed for {raw_output.name}",
-                        exit_code=1,
-                    )
-                final_image = target_png
-
-            # 打印干净响应与最终产物路径
-            clean_lines = [
-                line for line in last_response.splitlines()
-                if not line.strip().startswith("IMAGE_PATH:")
-            ]
-            clean_body = "\n".join(clean_lines).strip()
-            if clean_body:
-                print(clean_body)
-            print(f"IMAGE_PATH: {final_image.resolve()}")
-            return final_image
-        finally:
-            if final_src and final_src.is_file():
-                final_src.unlink(missing_ok=True)
+        # 打印干净响应与最终产物路径
+        clean_lines = [
+            line for line in last_response.splitlines()
+            if not line.strip().startswith("IMAGE_PATH:")
+        ]
+        clean_body = "\n".join(clean_lines).strip()
+        if clean_body:
+            print(clean_body)
+        print(f"IMAGE_PATH: {final_image.resolve()}")
+        return final_image
 
 
 def main() -> int:
@@ -511,7 +498,9 @@ def main() -> int:
     parser.add_argument("-k", "--chromakey", choices=["green", "magenta"], default=None, help="Optional chromakey color")
     parser.add_argument("--canvas", type=int, default=None, help="Square canvas size (e.g. 64, 96, 128, 256)")
     parser.add_argument("--model", default=None, help="Driver model for agy")
-    parser.add_argument("--timeout", type=int, default=180, help="Timeout in seconds")
+    parser.add_argument("--timeout", type=int, default=None, help="Timeout in seconds")
+    parser.add_argument("--lock-wait", type=int, default=None, help="Seconds to wait for single-instance lock")
+    parser.add_argument("--no-keep-raw", action="store_true", help="Do not keep the un-keyed raw image when using --chromakey")
     args = parser.parse_args()
 
     if not args.prompt or not args.output:
@@ -530,6 +519,8 @@ def main() -> int:
             name=args.name,
             model=args.model,
             timeout=args.timeout,
+            lock_wait=args.lock_wait,
+            keep_raw=not args.no_keep_raw,
         )
         return 0
     except EngineError as e:

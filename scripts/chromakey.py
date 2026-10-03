@@ -28,6 +28,13 @@ import pathlib
 import sys
 from typing import Tuple
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 from PIL import Image, ImageChops
 
 

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgyImagegenStandards",
+  "description": "Standard specifications for image generation and sprite asset pipelines",
+  "aspect_ratios": {
+    "16:9": { "name": "Widescreen Landscape", "recommended_for": ["desktop_wallpaper", "game_background", "cinematic_banner"] },
+    "9:16": { "name": "Portrait Story/Mobile", "recommended_for": ["mobile_wallpaper", "splash_screen", "character_poster"] },
+    "1:1":  { "name": "Square", "recommended_for": ["icons", "avatars", "sprites", "textures"] },
+    "4:3":  { "name": "Classic Landscape", "recommended_for": ["illustrations", "concept_art"] },
+    "3:4":  { "name": "Classic Portrait", "recommended_for": ["character_portrait", "card_art"] },
+    "2:3":  { "name": "Photo Portrait", "recommended_for": ["photography", "pinup_poster"] },
+    "3:2":  { "name": "Photo Landscape", "recommended_for": ["panoramic_art", "landscape_photo"] }
+  },
+  "chromakey": {
+    "green": {
+      "hex": "#00FF00",
+      "prompt_clause": "isolated on a solid pure neon green background (#00FF00), high contrast, flat lighting, clean sharp silhouette, no shadows on background, no green elements on the subject",
+      "default_threshold": 100.0,
+      "default_softness": 60.0,
+      "avoid_when": "subject has green elements (vegetation, slimes, emeralds, jade, green hair)"
+    },
+    "magenta": {
+      "hex": "#FF00FF",
+      "prompt_clause": "isolated on a solid pure vivid magenta background (#FF00FF), high contrast, flat lighting, clean sharp silhouette, no shadows on background, no magenta/pink elements on the subject",
+      "default_threshold": 80.0,
+      "default_softness": 60.0,
+      "recommended_when": "subject has green elements (trees, grass, slime, green cloth)"
+    }
+  },
+  "canvas_sizes": {
+    "64":  "Small sprite, miniature item, bullet icon, retro pixel asset",
+    "96":  "Standard inventory item, skill badge, low-res hero sprite",
+    "128": "Detailed equipment icon, spell effect, dialog thumbnail",
+    "256": "Full character battle sprite, boss monster, high-res UI icon",
+    "512": "High-fidelity dialog portrait, card battle graphic"
+  },
+  "default_padding_ratio": 0.04
+}
