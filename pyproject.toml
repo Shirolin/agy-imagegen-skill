@@ -4,25 +4,48 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agy-imagegen-skill"
-version = "0.1.0"
-description = "Antigravity image generation skill and chromakey post-processing pipeline"
+version = "1.0.0"
+description = "Universal AI image generation and standardized transparent asset pipeline for Google Antigravity & Agent Workflows."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
     { name = "Shirolin" }
 ]
+keywords = [
+    "antigravity",
+    "agent-skills",
+    "image-generation",
+    "chromakey",
+    "pixel-art",
+    "game-assets",
+    "sprites",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "Pillow>=9.5.0",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0.0",
-]
+[project.scripts]
+agy-img = "scripts.engine:main"
+chromakey = "scripts.chromakey:main"
+
+[project.urls]
+Homepage = "https://github.com/Shirolin/agy-imagegen-skill"
+Issues = "https://github.com/Shirolin/agy-imagegen-skill/issues"
 
 [tool.setuptools]
-py-modules = []
+packages = ["scripts"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
