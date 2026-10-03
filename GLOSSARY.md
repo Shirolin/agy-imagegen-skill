@@ -15,6 +15,7 @@
 - **Chromakey (色键抠图)**: 基于色相差判定算法（Greenness 与 Magentaness）将纯色背景分离为 Alpha 蒙版的技术。
 - **Despill (去色溢)**: 消除半透明边缘由于光栅化采样渗入的背景色（去绿边/去紫边）的颜色重构算法。
 - **Standardize / Canvas (尺寸规约)**: 基于真实不透明像素的紧凑包围盒（Bbox）裁剪，并在保持原始纵横比前提下缩放至预设画布尺寸（如 64, 96, 128, 256），四周保留预设呼吸边距（Padding）的工程化处理。
+- **Asset Standardizer (资产规约深模块)**: 纯内存的切片资产后处理深模块（`standardize_isolated_asset`）。对外仅暴露以 `Image.Image` 为入参的内存级接口，内部封装双通道 LUT 查表向量化抠图、边缘去色溢、紧凑 Bbox 裁剪与等比居中呼吸留白规约；杜绝文件 I/O 与终端控制台打印副作用，通过 `StandardizationError` 提供确定性的错误契约。
 
 ### 3. 接缝与适配器 (Seams & Adapters)
 - **CLI Adapter (命令行适配器)**: 位于系统最外层接缝（`bin/agy-img`、`bin/chromakey`），仅负责将终端命令行参数映射为 Pipeline Engine 接口参数，不承担业务实现。
