@@ -1,10 +1,19 @@
 @echo off
 setlocal
-REM Execute agy-img.ps1 with pwsh if available, fallback to powershell
-where pwsh >nul 2>nul
+REM Execute scripts\engine.py using python or py directly (Thin Adapter)
+set "SCRIPT_PATH=%~dp0..\scripts\engine.py"
+
+where python >nul 2>nul
 if %ERRORLEVEL% equ 0 (
-    pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0agy-img.ps1" %*
-) else (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0agy-img.ps1" %*
+    python "%SCRIPT_PATH%" %*
+    exit /b %ERRORLEVEL%
 )
-exit /b %ERRORLEVEL%
+
+where py >nul 2>nul
+if %ERRORLEVEL% equ 0 (
+    py "%SCRIPT_PATH%" %*
+    exit /b %ERRORLEVEL%
+)
+
+echo [ERROR] Python not found on PATH. Please install Python 3.10+ >&2
+exit /b 1

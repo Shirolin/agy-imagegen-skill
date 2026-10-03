@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+# agy-img — POSIX Shell Thin Adapter delegating to scripts/engine.py
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+ENGINE_PY="$SCRIPT_DIR/../scripts/engine.py"
+
+if command -v python3 >/dev/null 2>&1; then
+    exec python3 "$ENGINE_PY" "$@"
+elif command -v python >/dev/null 2>&1; then
+    exec python "$ENGINE_PY" "$@"
+else
+    echo "[ERROR] Python 3.10+ is required but not found on PATH." >&2
+    exit 1
+fi
