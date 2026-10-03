@@ -16,8 +16,11 @@ from engine import (
     is_path_inside,
     find_image_path,
     generate_image_asset,
+    ImageGenDriver,
+    MockDriver,
     InvalidArgumentError,
     LockBusyError,
+    EngineError,
 )
 
 
@@ -115,6 +118,68 @@ class TestPipelineEngine(unittest.TestCase):
             with self.assertRaises(InvalidArgumentError):
                 generate_image_asset(prompt="cube", output=out_file, canvas=-10)
 
+    def test_mock_driver_full_frame(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_file = pathlib.Path(tmpdir) / "landscape.png"
+            driver = MockDriver()
+            result = generate_image_asset(
+                prompt="cyberpunk city",
+                output=out_file,
+                ratio="16:9",
+                driver=driver,
+            )
+            self.assertEqual(result, out_file)
+            self.assertTrue(out_file.is_file())
+            self.assertGreater(out_file.stat().st_size, 0)
+            self.assertEqual(driver.calls, 1)
+            self.assertEqual(driver.history[0]["ratio"], "16:9")
+
+    def test_mock_driver_chromakey_and_raw_preservation(self):
+        import io
+        from PIL import Image
+
+        # 创建一个 32x32 绿底带红方块的测试位图
+        img = Image.new("RGB", (32, 32), (0, 255, 0))
+        for x in range(10, 22):
+            for y in range(10, 22):
+                img.putpixel((x, y), (255, 0, 0))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        mock_png_bytes = buf.getvalue()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_file = pathlib.Path(tmpdir) / "sprite.png"
+            driver = MockDriver(image_bytes=mock_png_bytes)
+            result = generate_image_asset(
+                prompt="pixel heart",
+                output=out_file,
+                chromakey="green",
+                canvas=64,
+                driver=driver,
+            )
+            self.assertEqual(result, out_file)
+            self.assertTrue(out_file.is_file())
+
+            # 验证原图保留文件 *_raw.png 存在且与 mock 数据一致
+            raw_file = out_file.with_name(f"{out_file.stem}_raw.png")
+            self.assertTrue(raw_file.is_file())
+            self.assertEqual(raw_file.read_bytes(), mock_png_bytes)
+
+            # 验证处理后的产物确实被透明化并规约居中到 64x64
+            with Image.open(out_file) as processed:
+                self.assertEqual(processed.size, (64, 64))
+                self.assertEqual(processed.mode, "RGBA")
+
+    def test_mock_driver_error_propagation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_file = pathlib.Path(tmpdir) / "failed.png"
+            driver = MockDriver(fail_times=1, error_to_raise=EngineError("Rate limit reached", exit_code=42))
+            with self.assertRaises(EngineError) as ctx:
+                generate_image_asset(prompt="anything", output=out_file, driver=driver)
+            self.assertEqual(ctx.exception.exit_code, 42)
+            self.assertIn("Rate limit reached", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -18,4 +18,7 @@
 
 ### 3. 接缝与适配器 (Seams & Adapters)
 - **CLI Adapter (命令行适配器)**: 位于系统最外层接缝（`bin/agy-img`、`bin/chromakey`），仅负责将终端命令行参数映射为 Pipeline Engine 接口参数，不承担业务实现。
+- **ImageGenDriver (生图驱动契约接缝)**: 位于 Pipeline Engine 内部的核心架构接缝（Seam）。定义从抽象提示词、参考图到本地位图生成的调用契约，将底层宿主通信协议与高层资产管线完全解耦。
+- **AgySubprocessDriver (CLI 子进程驱动适配器)**: 默认生产驱动适配器（Adapter）。封装子进程 `Popen` 调度、64KB+ 异步防死锁通信、魔数核验与瞬时重试状态机。
+- **MockDriver (内存模拟驱动适配器)**: 供单元测试与离线隔离环境使用的内存驱动。零磁盘与子进程 I/O 开销，实现毫秒级快速测试与精准故障注入。
 - **Driver Model (驱动调度模型)**: 负责在外部环境调用 `agy` 宿主执行生图任务的代理模型（默认为 `gemini-3.8-flash-low`），仅作为调度驱动，最终绘制由宿主原生的 `generate_image`（Imagen 3 / Nano Banana）承接。

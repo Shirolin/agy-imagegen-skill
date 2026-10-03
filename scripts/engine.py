@@ -3,7 +3,7 @@
 
 作为本项目的核心深模块 (Deep Module)，封装：
 1. 跨平台单实例并发互斥锁 (Cross-platform SingleInstanceLock)
-2. agy 宿主定位与子进程调度，防管道死锁安全异步读取
+2. 解耦驱动调度契约接缝 (ImageGenDriver Seam) 与生产级子进程适配器 (AgySubprocessDriver)
 3. 路径边界限制与参考图防逃逸验证
 4. 图像魔数快速校验与扩展名自适应校准
 5. 进程内直接衔接向量化色键抠图、去色溢与原图保护 (Keep-Raw)
@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import List, Tuple
+from typing import List, Protocol, Tuple, runtime_checkable
 
 if sys.platform == "win32":
     try:
@@ -240,69 +240,232 @@ def resolve_output_path(requested: pathlib.Path, kind_ext: str) -> pathlib.Path:
     return requested.with_suffix(want_ext)
 
 
-def invoke_agy_once(
-    agy_path: str,
-    model: str,
-    timeout_sec: int,
-    prompt_body: str,
-    work_dir: pathlib.Path,
-    extra_dirs: List[pathlib.Path],
-) -> Tuple[bool, bool, int, str, pathlib.Path | None, dict | None, str]:
-    """单次调用 agy 子进程调度出图，杜绝管道死锁。
+# ==============================================================================
+# Driver 架构接缝 (ImageGenDriver Seam & Adapters)
+# ==============================================================================
 
-    返回: (ok, recoverable, exit_code, response, src_path, image_kind, error_msg)
+@runtime_checkable
+class ImageGenDriver(Protocol):
+    """调度生图的底层驱动契约接缝 (Driver Seam)。"""
+
+    def dispatch(
+        self,
+        prompt: str,
+        work_dir: pathlib.Path,
+        refs: list[pathlib.Path],
+        ratio: str = "1:1",
+        name: str | None = None,
+        extra_dirs: list[pathlib.Path] | None = None,
+    ) -> Tuple[pathlib.Path, dict, str]:
+        """执行调度生成图像。
+
+        返回: (生成的图片路径, 魔数元数据字典, 响应日志文本)
+        若失败抛出 EngineError。
+        """
+        ...
+
+
+class AgySubprocessDriver:
+    """基于外部 agy CLI 子进程的生产驱动适配器。
+
+    内部封装：
+    - agy 可执行文件路径解析与鉴权校验
+    - 64KB+ 非阻塞管道防死锁调用 (proc.communicate)
+    - stdout 正则与路径沙箱校验 (find_image_path)
+    - 瞬时失败（超时、网络闪退、假图）自动重试 1 次的状态机
     """
-    cmd = [
-        agy_path,
-        "--model", model,
-        "--dangerously-skip-permissions",
-        "--print-timeout", f"{timeout_sec}s",
-        "--add-dir", str(work_dir.resolve()),
-    ]
-    seen_dirs = {str(work_dir.resolve())}
-    for d in extra_dirs:
-        d_str = str(d.resolve())
-        if d_str not in seen_dirs:
-            cmd.extend(["--add-dir", d_str])
-            seen_dirs.add(d_str)
 
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=str(work_dir),
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+    def __init__(
+        self,
+        model: str = "gemini-3.8-flash-low",
+        timeout: int = 180,
+        agy_path: str | None = None,
+        max_attempts: int = 2,
+    ):
+        self.model = model
+        self.timeout = timeout
+        self.agy_path = agy_path or resolve_agy_executable()
+        self.max_attempts = max_attempts
+        check_agy_auth()
+
+    def _invoke_once(
+        self,
+        prompt_body: str,
+        work_dir: pathlib.Path,
+        extra_dirs: list[pathlib.Path],
+    ) -> Tuple[bool, bool, int, str, pathlib.Path | None, dict | None, str]:
+        cmd = [
+            self.agy_path,
+            "--model", self.model,
+            "--dangerously-skip-permissions",
+            "--print-timeout", f"{self.timeout}s",
+            "--add-dir", str(work_dir.resolve()),
+        ]
+        seen_dirs = {str(work_dir.resolve())}
+        for d in extra_dirs:
+            d_str = str(d.resolve())
+            if d_str not in seen_dirs:
+                cmd.extend(["--add-dir", d_str])
+                seen_dirs.add(d_str)
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(work_dir),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError as e:
+            return False, False, 1, "", None, None, f"failed to start agy: {e}"
+
+        try:
+            stdout, stderr = proc.communicate(input=prompt_body, timeout=self.timeout + 20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            return False, True, 124, "", None, None, f"agy timed out after {self.timeout}s"
+
+        rc = proc.returncode
+        src = find_image_path(stdout, work_dir)
+
+        if not src or not src.is_file():
+            is_recoverable = (rc == 0 or rc == 124)
+            msg = f"agy failed (exit {rc}). {stderr.strip()}" if rc != 0 else (
+                "could not parse image path from agy output (no valid image under work dir)."
+            )
+            return False, is_recoverable, (rc if rc != 0 else 2), stdout, None, None, msg
+
+        kind = get_image_kind(src)
+        if not kind:
+            return False, True, 2, stdout, src, None, f"resolved path is not a valid image format ({src})."
+
+        return True, False, 0, stdout, src, kind, ""
+
+    def dispatch(
+        self,
+        prompt: str,
+        work_dir: pathlib.Path,
+        refs: list[pathlib.Path],
+        ratio: str = "1:1",
+        name: str | None = None,
+        extra_dirs: list[pathlib.Path] | None = None,
+    ) -> Tuple[pathlib.Path, dict, str]:
+        name_clause = f' Save the image with base name "{name}".' if name else ""
+
+        ref_block = ""
+        if refs:
+            ref_lines = [
+                "Reference images (MUST pass these absolute paths as ImagePaths / reference inputs "
+                "to generate_image for img2img or edit — do NOT only describe them in text):"
+            ]
+            for idx, rr in enumerate(refs, 1):
+                ref_lines.append(f"{idx}. {rr.resolve()}")
+            ref_lines.append(
+                "When calling generate_image, include every listed path as image/reference inputs. "
+                "Preserve subject identity and key visual traits from the references while applying the edit description below."
+            )
+            ref_block = "\n".join(ref_lines) + "\n\n"
+
+        mode_line = (
+            "Use your built-in generate_image tool (Nano Banana / Imagen) in image-to-image / edit mode with the reference ImagePaths below."
+            if refs else
+            "Use your built-in generate_image tool (Nano Banana / Imagen) to create an image. Do not describe the image in prose instead of generating it."
         )
-    except OSError as e:
-        return False, False, 1, "", None, None, f"failed to start agy: {e}"
 
-    try:
-        stdout, stderr = proc.communicate(input=prompt_body, timeout=timeout_sec + 20)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        return False, True, 124, "", None, None, f"agy timed out after {timeout_sec}s"
-
-    rc = proc.returncode
-    src = find_image_path(stdout, work_dir)
-
-    if not src or not src.is_file():
-        is_recoverable = (rc == 0 or rc == 124)
-        msg = f"agy failed (exit {rc}). {stderr.strip()}" if rc != 0 else (
-            "could not parse image path from agy output (no valid image under work dir)."
+        prompt_body = (
+            f"{mode_line}\n\n"
+            f"{ref_block}Description / edit instruction: {prompt}\n"
+            f"Aspect ratio: {ratio}.{name_clause}\n"
+            f"Write the output file under this absolute directory (create if needed): {work_dir.resolve()}\n\n"
+            "After generate_image succeeds, you MUST end your entire reply with exactly one line in this format (no quotes, no markdown, nothing after it):\n"
+            "IMAGE_PATH: <absolute path to the generated image file>\n\n"
+            "The IMAGE_PATH line is required for the calling wrapper."
         )
-        return False, is_recoverable, (rc if rc != 0 else 2), stdout, None, None, msg
 
-    kind = get_image_kind(src)
-    if not kind:
-        return False, True, 2, stdout, src, None, f"resolved path is not a valid image format ({src})."
+        all_extra = extra_dirs or []
+        last_error = ""
+        last_code = 1
 
-    return True, False, 0, stdout, src, kind, ""
+        for attempt in range(1, self.max_attempts + 1):
+            if attempt > 1:
+                print(f"retry: recoverable failure on attempt 1 ({last_error}); retrying once...", file=sys.stderr)
+                time.sleep(1)
 
+            ok, recoverable, code, response_txt, src_path, kind, err_msg = self._invoke_once(
+                prompt_body=prompt_body,
+                work_dir=work_dir,
+                extra_dirs=all_extra,
+            )
+
+            if ok and src_path and kind:
+                return src_path, kind, response_txt
+
+            last_error = err_msg
+            last_code = code
+            if not recoverable or attempt >= self.max_attempts:
+                break
+
+        raise EngineError(f"error: {last_error}", exit_code=last_code)
+
+
+class MockDriver:
+    """供单元测试与离线隔离环境使用的内存驱动适配器。零子进程开销。"""
+
+    def __init__(
+        self,
+        image_bytes: bytes | None = None,
+        image_ext: str = ".png",
+        fail_times: int = 0,
+        error_to_raise: Exception | None = None,
+    ):
+        # 默认使用合法的 1x1 最小有效 PNG
+        self.image_bytes = image_bytes or (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4"
+            b"\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        self.image_ext = image_ext
+        self.fail_times = fail_times
+        self.error_to_raise = error_to_raise
+        self.calls = 0
+        self.history: list[dict[str, Any]] = []
+
+    def dispatch(
+        self,
+        prompt: str,
+        work_dir: pathlib.Path,
+        refs: list[pathlib.Path],
+        ratio: str = "1:1",
+        name: str | None = None,
+        extra_dirs: list[pathlib.Path] | None = None,
+    ) -> Tuple[pathlib.Path, dict, str]:
+        self.calls += 1
+        self.history.append({
+            "prompt": prompt,
+            "work_dir": work_dir,
+            "refs": refs,
+            "ratio": ratio,
+            "name": name,
+            "extra_dirs": extra_dirs,
+        })
+        if self.calls <= self.fail_times:
+            if self.error_to_raise:
+                raise self.error_to_raise
+            raise EngineError(f"mock driver transient failure (attempt {self.calls})", exit_code=2)
+
+        file_name = f"{name or 'mock_generated'}{self.image_ext}"
+        out_file = work_dir / file_name
+        out_file.write_bytes(self.image_bytes)
+        kind = get_image_kind(out_file) or {"ext": self.image_ext, "len": len(self.image_bytes)}
+        return out_file, kind, f"Mock driver dispatched: {prompt}\nIMAGE_PATH: {out_file.resolve()}"
+
+
+# ==============================================================================
+# Pipeline Engine 核心高层编排接口 (Deep Interface)
+# ==============================================================================
 
 def generate_image_asset(
     prompt: str,
@@ -317,9 +480,10 @@ def generate_image_asset(
     lock_wait: int | None = None,
     keep_raw: bool = True,
     lock_path: str | pathlib.Path | None = None,
+    driver: ImageGenDriver | None = None,
 ) -> pathlib.Path:
-    """单一核心深模块接口 (Deep Interface)：完成生图、防逃逸、原图保护与向量化后处理规约全流程。"""
-    # 1. 基础校验
+    """单一核心深模块接口 (Deep Interface)：完成生图调度、防逃逸、原图保护与向量化后处理规约全流程。"""
+    # 1. 基础参数与路径校验
     prompt = prompt.strip()
     if not prompt:
         raise InvalidArgumentError("error: prompt required.")
@@ -368,121 +532,70 @@ def generate_image_asset(
     else:
         lock_wait_sec = 60
 
-    agy_exe = resolve_agy_executable()
-    check_agy_auth()
-
     extra_dirs = [out_dir]
     for r in resolved_refs:
         if r.parent not in extra_dirs:
             extra_dirs.append(r.parent)
 
-    # 2. 单实例并发互斥加锁
+    # 2. 默认构造生产级驱动适配器
+    if driver is None:
+        driver = AgySubprocessDriver(
+            model=driver_model,
+            timeout=timeout_sec,
+        )
+
+    # 3. 单实例并发互斥加锁调度
     with SingleInstanceLock(wait_seconds=lock_wait_sec, lock_path=lock_path):
-        name_clause = f' Save the image with base name "{name}".' if name else ""
-
-        ref_block = ""
-        if resolved_refs:
-            ref_lines = [
-                "Reference images (MUST pass these absolute paths as ImagePaths / reference inputs "
-                "to generate_image for img2img or edit — do NOT only describe them in text):"
-            ]
-            for idx, rr in enumerate(resolved_refs, 1):
-                ref_lines.append(f"{idx}. {rr.resolve()}")
-            ref_lines.append(
-                "When calling generate_image, include every listed path as image/reference inputs. "
-                "Preserve subject identity and key visual traits from the references while applying the edit description below."
+        work_dir = pathlib.Path(tempfile.mkdtemp(prefix="agy-img-"))
+        try:
+            src_path, kind, response_txt = driver.dispatch(
+                prompt=prompt,
+                work_dir=work_dir,
+                refs=resolved_refs,
+                ratio=ratio,
+                name=name,
+                extra_dirs=extra_dirs,
             )
-            ref_block = "\n".join(ref_lines) + "\n\n"
 
-        max_attempts = 2
-        last_error = ""
-        last_response = ""
-        final_image: pathlib.Path | None = None
+            # 4. 原图素材保护与色键后处理规约
+            if chromakey:
+                raw_stem = f"{out_path.stem}_raw" if keep_raw else f"{out_path.stem}_chroma_tmp"
+                raw_output = out_dir / f"{raw_stem}{kind['ext']}"
+                shutil.copy2(src_path, raw_output)
 
-        # 3. 调度循环与瞬时容错重试
-        for attempt in range(1, max_attempts + 1):
-            work_dir = pathlib.Path(tempfile.mkdtemp(prefix="agy-img-"))
-            try:
-                mode_line = (
-                    "Use your built-in generate_image tool (Nano Banana / Imagen) in image-to-image / edit mode with the reference ImagePaths below."
-                    if resolved_refs else
-                    "Use your built-in generate_image tool (Nano Banana / Imagen) to create an image. Do not describe the image in prose instead of generating it."
+                target_png = out_path.with_suffix(".png")
+                success = process_image(
+                    src_path=raw_output,
+                    dst_path=target_png,
+                    bg_color=chromakey.lower(),
+                    canvas_size=canvas,
+                    padding_ratio=0.04,
                 )
+                if not success or not target_png.is_file():
+                    raise EngineError(
+                        f"error: chromakey post-processing failed for {raw_output.name}",
+                        exit_code=1,
+                    )
+                if not keep_raw and raw_output.is_file():
+                    raw_output.unlink(missing_ok=True)
+                final_image = target_png
+            else:
+                raw_output = resolve_output_path(out_path, kind["ext"])
+                shutil.copy2(src_path, raw_output)
+                final_image = raw_output
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
-                prompt_body = (
-                    f"{mode_line}\n\n"
-                    f"{ref_block}Description / edit instruction: {prompt}\n"
-                    f"Aspect ratio: {ratio}.{name_clause}\n"
-                    f"Write the output file under this absolute directory (create if needed): {work_dir.resolve()}\n\n"
-                    "After generate_image succeeds, you MUST end your entire reply with exactly one line in this format (no quotes, no markdown, nothing after it):\n"
-                    "IMAGE_PATH: <absolute path to the generated image file>\n\n"
-                    "The IMAGE_PATH line is required for the calling wrapper."
-                )
-
-                if attempt > 1:
-                    print(f"retry: recoverable failure on attempt 1 ({last_error}); retrying once...", file=sys.stderr)
-                    time.sleep(2)
-
-                ok, recoverable, code, response_txt, src_path, kind, err_msg = invoke_agy_once(
-                    agy_path=agy_exe,
-                    model=driver_model,
-                    timeout_sec=timeout_sec,
-                    prompt_body=prompt_body,
-                    work_dir=work_dir,
-                    extra_dirs=extra_dirs,
-                )
-
-                last_response = response_txt
-                if ok and src_path and kind:
-                    # 4. 成功获取图片，直接拷贝至目标路径并处理原图保护
-                    if chromakey:
-                        # 开启色键时：原图保存为 *_raw.<ext>，保证素材不被覆盖丢失
-                        raw_stem = f"{out_path.stem}_raw" if keep_raw else f"{out_path.stem}_chroma_tmp"
-                        raw_output = out_dir / f"{raw_stem}{kind['ext']}"
-                        shutil.copy2(src_path, raw_output)
-
-                        target_png = out_path.with_suffix(".png")
-                        success = process_image(
-                            src_path=raw_output,
-                            dst_path=target_png,
-                            bg_color=chromakey.lower(),
-                            canvas_size=canvas,
-                            padding_ratio=0.04,
-                        )
-                        if not success or not target_png.is_file():
-                            raise EngineError(
-                                f"error: chromakey post-processing failed for {raw_output.name}",
-                                exit_code=1,
-                            )
-                        if not keep_raw and raw_output.is_file():
-                            raw_output.unlink(missing_ok=True)
-                        final_image = target_png
-                    else:
-                        # 全幅图像模式：根据真实魔数校准扩展名后直接落地
-                        raw_output = resolve_output_path(out_path, kind["ext"])
-                        shutil.copy2(src_path, raw_output)
-                        final_image = raw_output
-                    break
-
-                last_error = err_msg
-                if not recoverable or attempt >= max_attempts:
-                    raise EngineError(f"error: {err_msg}", exit_code=code)
-            finally:
-                shutil.rmtree(work_dir, ignore_errors=True)
-
-        if not final_image or not final_image.is_file():
-            raise EngineError(f"error: {last_error}", exit_code=1)
-
-        # 打印干净响应与最终产物路径
-        clean_lines = [
-            line for line in last_response.splitlines()
-            if not line.strip().startswith("IMAGE_PATH:")
-        ]
-        clean_body = "\n".join(clean_lines).strip()
-        if clean_body:
-            print(clean_body)
-        print(f"IMAGE_PATH: {final_image.resolve()}")
-        return final_image
+    # 5. 打印干净响应与最终产物契约
+    clean_lines = [
+        line for line in response_txt.splitlines()
+        if not line.strip().startswith("IMAGE_PATH:")
+    ]
+    clean_body = "\n".join(clean_lines).strip()
+    if clean_body:
+        print(clean_body)
+    print(f"IMAGE_PATH: {final_image.resolve()}")
+    return final_image
 
 
 def main() -> int:
