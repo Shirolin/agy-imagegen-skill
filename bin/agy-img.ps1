@@ -10,12 +10,12 @@ function Show-Help {
     'agy-img - headless image gen via agy (generate_image / Nano Banana)'
     ''
     'Usage:'
-    '  agy-img "prompt" -o <path> [--ref <img> ...] [--ratio 1:1|16:9|9:16|4:3|3:4] [--name <slug>] [--chromakey green|magenta] [--canvas <N>]'
+    '  agy-img "prompt" -o <path> [--ref <img> ...] [--ratio 1:1|16:9|9:16|4:3|3:4|2:3|3:2] [--name <slug>] [--chromakey green|magenta] [--canvas <N>]'
     ''
     'Options:'
     '  -o, --output <path>        Output image path (required)'
     '  --ref <path>               Reference image for img2img / style / edit (repeatable)'
-    '  --ratio <ratio>            Aspect ratio: 1:1, 16:9, 9:16, 4:3, 3:4 (default: 1:1)'
+    '  --ratio <ratio>            Aspect ratio: 1:1, 16:9, 9:16, 4:3, 3:4, 2:3, 3:2 (default: 1:1)'
     '  --name <slug>              Base filename hint'
     '  -k, --chromakey <color>    Optional post-process chromakey cutout: green or magenta'
     '  --canvas <N>               Square canvas size in pixels when using --chromakey (e.g. 64, 96, 128, 256)'
@@ -78,7 +78,13 @@ try {
   $m2 = Take-Flag '--model' $null; if ($m2) { $Model = $m2 }
   $t2 = Take-Flag '--timeout' $null; if ($t2) { $TimeoutSec = [int]$t2 }
   $k2 = Take-Flag '--chromakey' 'k'; if ($k2) { $Chromakey = $k2.ToLowerInvariant() }
-  $c2 = Take-Flag '--canvas' $null; if ($c2) { $Canvas = [int]$c2 }
+  $c2 = Take-Flag '--canvas' $null
+  if ($c2) {
+    if ($c2 -notmatch '^\d+$' -or [int]$c2 -le 0) {
+      throw "--canvas must be a positive integer, got '$c2'"
+    }
+    $Canvas = [int]$c2
+  }
   while ($true) {
     $rf = Take-Flag '--ref' $null
     if (-not $rf) { break }
@@ -109,8 +115,9 @@ if (-not $Output) {
   Write-Err 'error: -o / --output path required'
   exit 64
 }
-if ($Ratio -notin @('1:1', '16:9', '9:16', '4:3', '3:4')) {
-  Write-Err "error: invalid --ratio '$Ratio' (use 1:1|16:9|9:16|4:3|3:4)"
+$validRatios = @('1:1', '16:9', '9:16', '4:3', '3:4', '2:3', '3:2')
+if ($Ratio -notin $validRatios) {
+  Write-Err "error: invalid --ratio '$Ratio' (use $($validRatios -join '|'))"
   exit 64
 }
 if ($Chromakey -and ($Chromakey -notin @('green', 'magenta'))) {
@@ -176,10 +183,21 @@ foreach ($rr in $ResolvedRefs) {
 
 function Get-ImageKind([string]$path) {
   if (-not (Test-Path -LiteralPath $path)) { return $null }
-  $len = (Get-Item -LiteralPath $path).Length
-  if ($len -lt 1024) { return $null }
-  $hdr = [System.IO.File]::ReadAllBytes($path)
-  if ($hdr.Length -lt 12) { return $null }
+  $fi = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+  if (-not $fi -or $fi.Length -lt 16) { return $null }
+  $len = $fi.Length
+  $hdr = New-Object byte[] 16
+  $fs = $null
+  try {
+    $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    $read = $fs.Read($hdr, 0, 16)
+    if ($read -lt 12) { return $null }
+  } catch {
+    return $null
+  } finally {
+    if ($fs) { $fs.Dispose() }
+  }
+
   if ($hdr[0] -eq 0x89 -and $hdr[1] -eq 0x50 -and $hdr[2] -eq 0x4E -and $hdr[3] -eq 0x47) {
     return @{ Ext = '.png'; Len = $len }
   }
@@ -193,17 +211,40 @@ function Get-ImageKind([string]$path) {
   return $null
 }
 
+function Test-PathIsInside([string]$candidate, [string]$parentDir) {
+  try {
+    $targetFull = [System.IO.Path]::GetFullPath($candidate)
+    $parentFull = [System.IO.Path]::GetFullPath($parentDir)
+    if (-not $parentFull.EndsWith([System.IO.Path]::DirectorySeparatorChar.ToString())) {
+      $parentFull += [System.IO.Path]::DirectorySeparatorChar
+    }
+    return $targetFull.StartsWith($parentFull, [System.StringComparison]::OrdinalIgnoreCase)
+  } catch {
+    return $false
+  }
+}
+
 function Find-ImagePath([string]$text, [string]$dir) {
   $src = $null
   if ($text) {
     foreach ($line in ($text -split "`r?`n")) {
       if ($line -match '^\s*IMAGE_PATH:\s*(.+)\s*$') {
-        $src = $Matches[1].Trim().Trim('"').Trim("'")
+        $cand = $Matches[1].Trim().Trim('"').Trim("'")
+        if ((Test-Path -LiteralPath $cand) -and (Test-PathIsInside $cand $dir)) {
+          $src = $cand
+          break
+        }
       }
     }
-    if (-not $src -or -not (Test-Path -LiteralPath $src)) {
-      $m = [regex]::Match($text, '(?i)([A-Za-z]:\\[^\s"'']+\.(?:png|jpe?g|webp)|/[^\s"'']+\.(?:png|jpe?g|webp))')
-      if ($m.Success) { $src = $m.Groups[1].Value }
+    if (-not $src) {
+      $matches = [regex]::Matches($text, '(?i)([A-Za-z]:\\[^\s"'']+\.(?:png|jpe?g|webp)|/[^\s"'']+\.(?:png|jpe?g|webp))')
+      foreach ($m in $matches) {
+        $cand = $m.Groups[1].Value
+        if ((Test-Path -LiteralPath $cand) -and (Test-PathIsInside $cand $dir)) {
+          $src = $cand
+          break
+        }
+      }
     }
   }
   if ((-not $src -or -not (Test-Path -LiteralPath $src)) -and (Test-Path -LiteralPath $dir)) {
@@ -225,9 +266,9 @@ function Resolve-OutputPath([string]$requested, $kind) {
 function Invoke-AgyOnce([string]$agyPath, [string]$model, [int]$timeoutSec, [string]$promptBody, [string]$work, [string[]]$extraDirs) {
   $timeoutArg = "${timeoutSec}s"
   $addParts = New-Object System.Collections.Generic.List[string]
-  [void]$addParts.Add("--add-dir `"$work`"")
+  [void]$addParts.Add("--add-dir `"$($work.TrimEnd('\'))`"")
   foreach ($d in ($extraDirs | Select-Object -Unique)) {
-    if ($d) { [void]$addParts.Add("--add-dir `"$d`"") }
+    if ($d) { [void]$addParts.Add("--add-dir `"$($d.TrimEnd('\'))`"") }
   }
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $agyPath
@@ -244,6 +285,11 @@ function Invoke-AgyOnce([string]$agyPath, [string]$model, [int]$timeoutSec, [str
   $proc = New-Object System.Diagnostics.Process
   $proc.StartInfo = $psi
   [void]$proc.Start()
+
+  # 异步读取 stdout 和 stderr，防止管道填满导致 WaitForExit 死锁
+  $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+  $stderrTask = $proc.StandardError.ReadToEndAsync()
+
   $proc.StandardInput.Write($promptBody)
   $proc.StandardInput.Close()
 
@@ -253,13 +299,14 @@ function Invoke-AgyOnce([string]$agyPath, [string]$model, [int]$timeoutSec, [str
     return @{ Ok = $false; Recoverable = $true; Code = 124; Error = "agy timed out after ${timeoutSec}s"; Response = ''; Stderr = ''; Src = $null; Work = $work }
   }
 
-  $response = $proc.StandardOutput.ReadToEnd()
-  $stderrTxt = $proc.StandardError.ReadToEnd()
+  $response = $stdoutTask.GetAwaiter().GetResult()
+  $stderrTxt = $stderrTask.GetAwaiter().GetResult()
   $rc = $proc.ExitCode
   $src = Find-ImagePath $response $work
   if (-not $src -or -not (Test-Path -LiteralPath $src)) {
     $msg = if ($rc -ne 0) { "agy failed (exit $rc). $($stderrTxt.Trim())" } else { 'could not parse image path from agy output (no IMAGE_PATH / no image file under work dir).' }
-    return @{ Ok = $false; Recoverable = $true; Code = $(if ($rc -ne 0) { $rc } else { 2 }); Error = $msg; Response = $response; Stderr = $stderrTxt; Src = $null; Work = $work }
+    $isRecoverable = ($rc -eq 0 -or $rc -eq 124)
+    return @{ Ok = $false; Recoverable = $isRecoverable; Code = $(if ($rc -ne 0) { $rc } else { 2 }); Error = $msg; Response = $response; Stderr = $stderrTxt; Src = $null; Work = $work }
   }
   $kind = Get-ImageKind $src
   if (-not $kind) {
@@ -275,37 +322,45 @@ if ($env:AGY_IMG_LOCK_WAIT) { $lockWait = [int]$env:AGY_IMG_LOCK_WAIT }
 $lockPath = Join-Path $env:TEMP 'agy-img.single.lock'
 $lockStream = $null
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
+$lastLockError = ''
 
 while ($sw.Elapsed.TotalSeconds -lt $lockWait) {
   try {
-    # Check if lock file exists and holder process is dead
-    if (Test-Path -LiteralPath $lockPath) {
-      try {
-        $content = [System.IO.File]::ReadAllText($lockPath)
-        if ($content -match 'pid=(\d+)') {
-          $holderPid = [int]$Matches[1]
-          $holderProc = Get-Process -Id $holderPid -ErrorAction SilentlyContinue
-          if (-not $holderProc) {
-            # Holder is dead! Reclaim orphan lock
-            [System.IO.File]::Delete($lockPath)
-          }
-        }
-      } catch {}
-    }
-
     $lockStream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
     $lockBytes = [System.Text.Encoding]::UTF8.GetBytes("pid=$PID ts=$(Get-Date -Format o)`n")
     $lockStream.SetLength(0)
     $lockStream.Write($lockBytes, 0, $lockBytes.Length)
     $lockStream.Flush()
     break
-  } catch {
+  } catch [System.IO.IOException] {
+    $lastLockError = $_.Exception.Message
+    # 尝试探查占用锁的 pid
+    try {
+      if (Test-Path -LiteralPath $lockPath) {
+        $fsRead = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $sr = [System.IO.StreamReader]::new($fsRead)
+        $content = $sr.ReadToEnd()
+        $sr.Dispose()
+        if ($content -match 'pid=(\d+)') {
+          $holderPid = [int]$Matches[1]
+          $holderProc = Get-Process -Id $holderPid -ErrorAction SilentlyContinue
+          if (-not $holderProc) {
+            # 持有进程已死亡，尝试清除残留锁文件
+            try { [System.IO.File]::Delete($lockPath) } catch {}
+          }
+        }
+      }
+    } catch {}
     Start-Sleep -Milliseconds 300
+  } catch {
+    # 非并发冲突异常直接报告退出
+    Write-Err "error: cannot create lock file ($lockPath): $($_.Exception.Message)"
+    exit 1
   }
 }
 
 if (-not $lockStream) {
-  Write-Err "error: agy-img busy (another instance holds the lock after ${lockWait}s). Set AGY_IMG_LOCK_WAIT to wait longer."
+  Write-Err "error: agy-img busy (another instance holds the lock after ${lockWait}s: $lastLockError). Set AGY_IMG_LOCK_WAIT to wait longer."
   exit 75
 }
 
@@ -398,21 +453,39 @@ The IMAGE_PATH line is required for the calling wrapper.
   if ($Chromakey) {
     $scriptDir = Split-Path -Parent $PSScriptRoot
     $chromaPy = Join-Path $scriptDir 'scripts\chromakey.py'
-    if (Test-Path -LiteralPath $chromaPy) {
-      $pyCmd = if (Get-Command python -ErrorAction SilentlyContinue) { 'python' } else { 'py' }
-      $targetPng = [System.IO.Path]::ChangeExtension($rawOutput, '.png')
-      $canvasArgs = if ($Canvas) { "--canvas $Canvas" } else { "" }
-      
-      $cutoutCmd = "$pyCmd `"$chromaPy`" `"$rawOutput`" -o `"$targetPng`" --bg $Chromakey $canvasArgs"
-      $res = Invoke-Expression $cutoutCmd 2>&1
-      if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $targetPng)) {
-        $finalImage = $targetPng
-      } else {
-        Write-Err "warn: chromakey post-processing failed: $res"
-      }
-    } else {
-      Write-Err "warn: scripts\chromakey.py not found, skipping chromakey."
+    if (-not (Test-Path -LiteralPath $chromaPy)) {
+      $cmd = Get-Command chromakey -ErrorAction SilentlyContinue
+      if ($cmd) { $chromaPy = $cmd.Source }
     }
+
+    if (-not (Test-Path -LiteralPath $chromaPy)) {
+      Write-Err "error: chromakey tool not found (scripts/chromakey.py). Cannot perform requested chromakey."
+      exit 1
+    }
+
+    $pyCmd = if (Get-Command python -ErrorAction SilentlyContinue) { 'python' } else { 'py' }
+    $targetPng = [System.IO.Path]::ChangeExtension($rawOutput, '.png')
+    
+    $pyArgs = [System.Collections.Generic.List[string]]::new()
+    [void]$pyArgs.Add($chromaPy)
+    [void]$pyArgs.Add($rawOutput)
+    [void]$pyArgs.Add('-o')
+    [void]$pyArgs.Add($targetPng)
+    [void]$pyArgs.Add('--bg')
+    [void]$pyArgs.Add($Chromakey)
+    if ($Canvas) {
+      [void]$pyArgs.Add('--canvas')
+      [void]$pyArgs.Add($Canvas.ToString())
+    }
+
+    $chromaRes = & $pyCmd @pyArgs 2>&1
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $targetPng)) {
+      Write-Err "error: chromakey post-processing failed (exit code $LASTEXITCODE):"
+      Write-Err ($chromaRes -join "`n")
+      exit $(if ($LASTEXITCODE -ne 0) { $LASTEXITCODE } else { 1 })
+    }
+
+    $finalImage = $targetPng
   }
 
   $clean = ($last.Response -split "`r?`n" | Where-Object { $_ -notmatch '^\s*IMAGE_PATH:\s*' }) -join "`n"

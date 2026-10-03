@@ -3,8 +3,8 @@ r"""install.py — agy-imagegen-skill 安装与环境配置脚本。
 
 功能：
 1. 检查并安装 Python 依赖（Pillow）
-2. 将 bin/ 加入用户 PATH 环境变量（优先于或替代旧 C:\Software\agy-img）
-3. 将 skills/agy-imagegen 软链至全局 ~/.gemini/config/skills/agy-imagegen
+2. 将 bin/ 加入用户 PATH 环境变量（清理旧失效路径，广播变更）
+3. 将 skills/agy-imagegen 软链或复制至全局 ~/.gemini/config/skills/agy-imagegen
 """
 
 from __future__ import annotations
@@ -12,15 +12,31 @@ from __future__ import annotations
 import argparse
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 
 if sys.platform == "win32":
     import winreg
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 SKILL_ROOT = pathlib.Path(__file__).resolve().parent.parent
 BIN_DIR = SKILL_ROOT / "bin"
 SOURCE_SKILL_DIR = SKILL_ROOT / "skills" / "agy-imagegen"
+REFERENCES_DIR = SKILL_ROOT / "references"
+
+
+def sync_skill_assets() -> None:
+    """确保 skills/agy-imagegen 自包含 references。"""
+    target_ref = SOURCE_SKILL_DIR / "references"
+    if REFERENCES_DIR.exists():
+        target_ref.mkdir(parents=True, exist_ok=True)
+        for f in REFERENCES_DIR.glob("*.md"):
+            shutil.copy2(f, target_ref / f.name)
 
 
 def check_and_install_dependencies() -> bool:
@@ -36,6 +52,29 @@ def check_and_install_dependencies() -> bool:
         return res.returncode == 0
 
 
+def broadcast_environment_change() -> None:
+    """在 Windows 上广播 WM_SETTINGCHANGE 通知。"""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        HWND_BROADCAST = 0xFFFF
+        WM_SETTINGCHANGE = 0x001A
+        SMTO_ABORTIFHUNG = 0x0002
+        result = ctypes.c_ulong()
+        ctypes.windll.user32.SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            "Environment",
+            SMTO_ABORTIFHUNG,
+            3000,
+            ctypes.byref(result),
+        )
+    except Exception:
+        pass
+
+
 def update_windows_user_path(add_bin: bool = True) -> bool:
     """更新 Windows 当前用户的 PATH 环境变量。"""
     if sys.platform != "win32":
@@ -43,6 +82,9 @@ def update_windows_user_path(add_bin: bool = True) -> bool:
         return True
 
     bin_str = str(BIN_DIR)
+    bin_norm = os.path.normpath(bin_str).lower()
+    legacy_paths = [r"c:\software\agy-img"]
+
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
             try:
@@ -50,32 +92,35 @@ def update_windows_user_path(add_bin: bool = True) -> bool:
             except FileNotFoundError:
                 current_path, reg_type = "", winreg.REG_EXPAND_SZ
 
-            parts = [p.strip() for p in current_path.split(";") if p.strip()]
+            raw_parts = [p.strip() for p in current_path.split(";") if p.strip()]
+            parts: list[str] = []
+
+            # 清理旧历史路径及现有本目录路径
+            for p in raw_parts:
+                norm_p = os.path.normpath(p).lower()
+                if norm_p in legacy_paths or norm_p == bin_norm:
+                    continue
+                parts.append(p)
 
             if add_bin:
-                if bin_str not in parts:
-                    # 插入到最前面以获得最高优先权
-                    parts.insert(0, bin_str)
-                    new_path = ";".join(parts)
-                    winreg.SetValueEx(key, "Path", 0, reg_type, new_path)
-                    print(f"[+] 已将 {bin_str} 写入用户 PATH 环境变量。")
-                else:
-                    print(f"[+] 用户 PATH 中已存在 {bin_str}。")
+                parts.insert(0, bin_str)
+                new_path = ";".join(parts)
+                winreg.SetValueEx(key, "Path", 0, reg_type, new_path)
+                print(f"[+] 已将 {bin_str} 写入用户 PATH 环境变量（置顶生效）。")
             else:
-                if bin_str in parts:
-                    parts = [p for p in parts if p != bin_str]
-                    new_path = ";".join(parts)
-                    winreg.SetValueEx(key, "Path", 0, reg_type, new_path)
-                    print(f"[+] 已从用户 PATH 中移除 {bin_str}。")
+                new_path = ";".join(parts)
+                winreg.SetValueEx(key, "Path", 0, reg_type, new_path)
+                print(f"[+] 已从用户 PATH 中移除 {bin_str}。")
 
+        broadcast_environment_change()
         return True
     except Exception as e:
         print(f"[-] 更新用户 PATH 失败: {e}", file=sys.stderr)
         return False
 
 
-def link_global_skill(unlink: bool = False) -> bool:
-    """软链到 ~/.gemini/config/skills/agy-imagegen。"""
+def link_global_skill(unlink: bool = False, prefer_symlink: bool = True) -> bool:
+    """软链或复制至 ~/.gemini/config/skills/agy-imagegen。"""
     home = pathlib.Path.home()
     target_dir = home / ".gemini" / "config" / "skills" / "agy-imagegen"
 
@@ -84,42 +129,47 @@ def link_global_skill(unlink: bool = False) -> bool:
             target_dir.unlink()
             print(f"[+] 已移除软链: {target_dir}")
         elif target_dir.is_dir():
-            import shutil
-            shutil.rmtree(target_dir)
-            print(f"[+] 已删除目录: {target_dir}")
+            # 安全检查：仅当目录内包含本项目标记时才执行删除
+            marker = target_dir / "SKILL.md"
+            if marker.exists() and "agy-imagegen" in marker.read_text(encoding="utf-8", errors="ignore"):
+                shutil.rmtree(target_dir)
+                print(f"[+] 已安全删除技能目录: {target_dir}")
+            else:
+                print(f"[!] 警告: 目录 {target_dir} 缺少有效标记，跳过删除以防误伤。", file=sys.stderr)
         return True
 
+    sync_skill_assets()
     target_dir.parent.mkdir(parents=True, exist_ok=True)
 
     if target_dir.exists() or target_dir.is_symlink():
-        if target_dir.is_symlink() and target_dir.resolve() == SOURCE_SKILL_DIR.resolve():
-            print(f"[+] 软链已正确存在: {target_dir} -> {SOURCE_SKILL_DIR}")
-            return True
-        print(f"[!] 目标位置已存在 {target_dir}，正在更新软链...")
-        if target_dir.is_symlink() or target_dir.is_file():
+        if target_dir.is_symlink():
+            try:
+                if target_dir.resolve() == SOURCE_SKILL_DIR.resolve():
+                    print(f"[+] 软链已正确存在: {target_dir} -> {SOURCE_SKILL_DIR}")
+                    return True
+            except Exception:
+                pass
             target_dir.unlink()
-        else:
-            import shutil
+        elif target_dir.is_dir():
             shutil.rmtree(target_dir)
 
-    try:
-        # 在 Windows 上创建目录符号链接
-        target_dir.symlink_to(SOURCE_SKILL_DIR, target_is_directory=True)
-        print(f"[+] 成功创建全局技能软链: {target_dir} -> {SOURCE_SKILL_DIR}")
-        return True
-    except OSError as e:
-        # 如果没有符号链接权限（非管理员未开启开发者模式），回退到复制模式
-        print(f"[!] 创建软链失败 ({e})，回退为目录拷贝同步模式...")
-        import shutil
-        shutil.copytree(SOURCE_SKILL_DIR, target_dir)
-        print(f"[+] 已复制技能文件至: {target_dir}")
-        return True
+    if prefer_symlink:
+        try:
+            target_dir.symlink_to(SOURCE_SKILL_DIR, target_is_directory=True)
+            print(f"[+] 成功创建全局技能软链: {target_dir} -> {SOURCE_SKILL_DIR}")
+            return True
+        except OSError as e:
+            print(f"[!] 创建软链未获权限 ({e})，自动回退为目录拷贝模式...")
+
+    shutil.copytree(SOURCE_SKILL_DIR, target_dir)
+    print(f"[+] 已复制技能文件至: {target_dir}")
+    return True
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="agy-imagegen-skill 安装与配置工具")
-    parser.add_argument("-dev", action="store_true", help="开发者模式")
-    parser.add_argument("-uninstall", action="store_true", help="卸载 PATH 和软链")
+    parser.add_argument("-dev", action="store_true", help="开发者模式：强行使用软链连接")
+    parser.add_argument("-uninstall", action="store_true", help="卸载 PATH 和全局技能")
     args = parser.parse_args()
 
     if args.uninstall:
@@ -140,11 +190,11 @@ def main() -> int:
     if not update_windows_user_path(add_bin=True):
         print("[-] PATH 配置遇到问题。", file=sys.stderr)
 
-    if not link_global_skill(unlink=False):
-        print("[-] 技能软链配置遇到问题。", file=sys.stderr)
+    if not link_global_skill(unlink=False, prefer_symlink=True):
+        print("[-] 技能配置遇到问题。", file=sys.stderr)
 
     print("\n[+] 全部配置完成！")
-    print("    - 命令行测试: 在新终端中执行 `agy-img --help`")
+    print("    - 命令行已就绪: `agy-img --help` 或 `chromakey --help`")
     print("    - 技能已注入: ~/.gemini/config/skills/agy-imagegen")
     print("==========================================")
     return 0

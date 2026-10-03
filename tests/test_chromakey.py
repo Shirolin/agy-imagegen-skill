@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from chromakey import (
     calculate_alpha_green,
     calculate_alpha_magenta,
+    chromakey_vectorized,
     despill_green,
     despill_magenta,
     process_image,
@@ -49,6 +50,36 @@ def test_despill():
     # 洋红边缘带紫红溢色
     r_m, g_m, b_m = despill_magenta(180, 50, 180, 0.5)
     assert r_m < 180 and b_m < 180
+
+
+def test_vectorized_consistency():
+    """验证向量化方法与标量参考实现像素一致性（最大容许误差 <= 1）。"""
+    img = Image.new("RGBA", (32, 32))
+    px = img.load()
+    for y in range(32):
+        for x in range(32):
+            px[x, y] = (x * 8, y * 8, ((x + y) * 4) % 256, 255)
+
+    for bg in ("green", "magenta"):
+        vec_out = chromakey_vectorized(img, bg_color=bg)
+        v_px = vec_out.load()
+        calc_alpha = calculate_alpha_magenta if bg == "magenta" else calculate_alpha_green
+        calc_despill = despill_magenta if bg == "magenta" else despill_green
+        thresh = 80.0 if bg == "magenta" else 100.0
+
+        for y in range(32):
+            for x in range(32):
+                r, g, b, _ = px[x, y]
+                a_expected = calc_alpha(r, g, b, threshold=thresh, softness=60.0)
+                expected_alpha = int(round(a_expected * 255))
+                v_r, v_g, v_b, v_a = v_px[x, y]
+
+                assert abs(v_a - expected_alpha) <= 1
+                if expected_alpha > 0:
+                    exp_r, exp_g, exp_b = calc_despill(r, g, b, a_expected)
+                    assert abs(v_r - exp_r) <= 1
+                    assert abs(v_g - exp_g) <= 1
+                    assert abs(v_b - exp_b) <= 1
 
 
 def test_process_image_end_to_end():
@@ -99,5 +130,6 @@ if __name__ == "__main__":
     test_green_keyout()
     test_magenta_keyout()
     test_despill()
+    test_vectorized_consistency()
     test_process_image_end_to_end()
     print("[+] 全部单元测试通过！")

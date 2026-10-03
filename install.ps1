@@ -5,14 +5,15 @@
 #   .\install.ps1 -dev               # Developer mode: symlink skills
 #   .\install.ps1 -uninstall         # Remove PATH entry and symlinks
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $SkillRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 function Find-Python {
-    foreach ($candidate in "python", "python3", "py") {
+    foreach ($candidate in 'python', 'python3', 'py') {
         if (Get-Command $candidate -ErrorAction SilentlyContinue) {
-            $versionCheck = & $candidate -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>$null
+            & $candidate -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>$null | Out-Null
             if ($LASTEXITCODE -eq 0) {
                 return $candidate
             }
@@ -23,8 +24,10 @@ function Find-Python {
 
 $Python = Find-Python
 if (-not $Python) {
-    Write-Error "[ERROR] Python 3.10+ is required but not found on PATH."
+    [Console]::Error.WriteLine('[ERROR] Python 3.10+ is required but not found on PATH.')
     exit 1
 }
 
-& $Python "$SkillRoot\scripts\install.py" $args
+$installPy = Join-Path $SkillRoot 'scripts\install.py'
+& $Python $installPy @args
+exit $LASTEXITCODE
