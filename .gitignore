@@ -42,3 +42,9 @@ temp/
 *.log
 test-output/
 *.lock
+
+# OS & Local Agent Workspaces
+.DS_Store
+Thumbs.db
+desktop.ini
+.scratch/

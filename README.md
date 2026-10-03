@@ -8,6 +8,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Antigravity Skill](https://img.shields.io/badge/Antigravity-Skill%20v2.0-orange.svg)](https://github.com/Shirolin/agy-imagegen-skill)
+[![爱发电](https://img.shields.io/badge/爱发电-shirolin-946ce6.svg?logo=curseforge&logoColor=white)](https://ifdian.net/a/shirolin)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-shirolin-F16061.svg?logo=ko-fi&logoColor=white)](https://ko-fi.com/shirolin)
 
 </div>
 
@@ -22,10 +24,10 @@
 
 ```text
 Prompt: "Studio Ghibli style anime concept art of a legendary floating castle island in the sky..."
-Command: agy-img "<prompt>" -o dist/ghibli_laputa_castle.jpg --ratio 16:9
+Command: agy-img "<prompt>" -o docs/images/ghibli_laputa_castle.jpg --ratio 16:9
 ```
 <div align="center">
-  <img src="./dist/ghibli_laputa_castle.jpg" width="85%" alt="16:9 Ghibli Floating Castle" />
+  <img src="./docs/images/ghibli_laputa_castle.jpg" width="85%" alt="16:9 Ghibli Floating Castle" />
 </div>
 
 ---
@@ -35,7 +37,7 @@ Command: agy-img "<prompt>" -o dist/ghibli_laputa_castle.jpg --ratio 16:9
 
 | 步骤 1：大模型原生绿底出图 (`cyber_wolf_raw.png`) | 步骤 2：自动色键剔除 + 去绿边 + 居中规约 (`cyber_wolf.png`) |
 | :---: | :---: |
-| <img src="./dist/cyber_wolf_raw.png" width="300" alt="Raw Green Background Boss" /> | <img src="./dist/cyber_wolf.png" width="256" alt="Standardized Transparent Asset" /> |
+| <img src="./docs/images/cyber_wolf_raw.png" width="300" alt="Raw Green Background Boss" /> | <img src="./docs/images/cyber_wolf.png" width="256" alt="Standardized Transparent Asset" /> |
 | **原始素材保全**：1024×1024 纯霓虹绿底 (#00FF00) | **交付成果**：256×256 干净透明底，4% 呼吸边距居中，边缘无绿边 |
 
 ---
@@ -211,6 +213,15 @@ python -m unittest discover tests -v
 * 向量化色相差算法与标量参考实现像素级一致性（误差 <= 1）；
 * 原图 `*_raw.png` 安全保护与透明交付断言；
 * 内核级单实例并发锁争用与超时机制。
+
+---
+
+## 💖 赞助与支持 (Sponsor & Support)
+
+如果你觉得本项目对你的开发与创作有所帮助，欢迎支持开发者的持续维护：
+
+- 💖 **爱发电 (Afdian)**: [https://ifdian.net/a/shirolin](https://ifdian.net/a/shirolin)
+- ☕ **Ko-fi**: [https://ko-fi.com/shirolin](https://ko-fi.com/shirolin)
 
 ---
 
