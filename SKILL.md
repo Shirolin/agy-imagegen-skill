@@ -5,8 +5,10 @@ description: >-
   Activate this skill when the user wants to generate full-frame concept art, scene backgrounds,
   wallpapers, or UI textures, edit images using reference inputs (img2img / style transfer),
   or produce transparent sprites, character portraits, and icons via solid-color chromakey cutout (green/magenta)
-  with despill and canvas standardization.
+  with despill and canvas standardization. Do NOT activate for pure image inspection, image captioning,
+  or writing general UI layout code without generating or processing image assets.
   当用户提出生图、画图、插画、场景原画、制作游戏立绘/精灵、道具UI图标、绿幕或洋红底色键抠图规约、去色溢或垫图图生图需求时使用。
+  若仅查看/分析已有图片或编写普通前端UI代码（无需生成图像资产），请勿激活。
 ---
 
 # agy-imagegen
@@ -34,6 +36,12 @@ graph TD
 | :--- | :--- | :--- | :--- |
 | **全幅图像 (Track A)** | 场景原画、网站横幅/Hero、壁纸、海报、平铺纹理 | 丰富环境构图，**严禁添加纯色底或开启抠图** | `--ratio 16:9\|9:16\|1:1\|4:3\|3:4\|2:3\|3:2` |
 | **透明资产 (Track B)** | 角色立绘、游戏精灵、掉落物、技能图标、UI 控件 | 纯色底生成 + 向量化色相差色键 + 去色溢 + 呼吸留白居中 | `-k green\|magenta --canvas <64\|96\|128\|256>` |
+
+### 模糊意图启发式推断准则 (Ambiguous Intent Heuristics)
+当用户输入较为简短或未明确声明背景形态时（例如：“画一只手持光剑的火柴人”）：
+1. **实体单体偏向 (优先 Track B)**：若描述对象为角色、生物、武器、道具、装备、卡牌徽章或 UI 控件单体，默认判定为**独立切片资产 (Track B)**，自动锁定纯色底出图并执行居中规约。
+2. **场景空间偏向 (优先 Track A)**：若描述对象侧重场景、环境、空间、天气、建筑全景或情绪氛围，默认判定为**全幅图像 (Track A)**，禁止开启抠图。
+3. **主体色避让自动生效**：在判定为 Track B 后，若主体含绿色元素（如史莱姆、草系精灵、绿植、青翠玉石），自动避让切换为洋红底（`-k magenta`）。
 
 详细画幅比速查与标准尺寸矩阵参见 [resources/standards.json](./resources/standards.json)。
 
